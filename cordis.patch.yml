@@ -1,0 +1,17 @@
+# dsh-preset-inspector bundle patch.
+#
+# One host row, no tools of its own, so it costs a Standard session nothing in
+# tool schemas. It reads the live preset registry and pushes a read-only
+# inventory into the Web GUI index through `webserver/index-inject`.
+#
+# `inject` is read from the ENTRY ROW, not the module exports
+# (`Inject.resolve(fiber.entry.options.inject, fiber.inject)`), so both services
+# are declared here. Without `agentPresets` the plugin cannot see the preset
+# roster at all.
+- insert:
+    - id: preset-inspector
+      name: 'dsh-preset-inspector'
+      config: {}
+      inject:
+        - loader
+        - agentPresets

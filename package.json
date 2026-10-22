@@ -1,0 +1,65 @@
+{
+  "name": "dsh-preset-inspector",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Live, read-only inventory of every agent preset: the tools, conditional tools, MCP servers, skills and plugin rows each preset actually composes, as a panel inside the Web GUI.",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "preset",
+    "inventory",
+    "ui"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.2": "compatible"
+      },
+      "node": ">=22"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "ui.js",
+    "lib",
+    "build.mjs",
+    "cordis.patch.yml",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "dsh-presets": "./bin/dsh-presets",
+    "dsh-preset-plugin": "./bin/dsh-preset-plugin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anonamerjaxon-dev/dsh-preset-inspector.git"
+  },
+  "homepage": "https://github.com/anonamerjaxon-dev/dsh-preset-inspector#readme",
+  "bugs": {
+    "url": "https://github.com/anonamerjaxon-dev/dsh-preset-inspector/issues"
+  },
+  "author": "JAXON"
+}

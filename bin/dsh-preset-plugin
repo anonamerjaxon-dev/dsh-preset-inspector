@@ -1,0 +1,477 @@
+#!/usr/bin/env node
+// dsh-preset-plugin — decide which presets a plugin lives in, without hand-editing YAML.
+//
+// ── The rule this tool encodes ────────────────────────────────────────────
+//
+// A plugin installed as a BUNDLE inserts its loader row at HOST level. A host
+// row is visible inside every preset (the tool registry inherits ancestor
+// layers), so "installed" means "everyone gets it". That is the right default —
+// a new plugin works in every session immediately — but it is the wrong place
+// for anything narrow, and it costs tokens in every session until moved.
+//
+// Moving it means exactly two edits in `profiles/<name>/cordis.patch.yml`:
+//
+//   1. a host-level `- id: <row>  disabled: true` — the patch layer can change
+//      an existing entry, so this switches the bundle's own row off;
+//   2. one child row inside each target preset's `config.plugins` list — this is
+//      the ONLY mount, so the plugin is loaded exactly once.
+//
+// Both are applied here with a backup, a YAML parse check, and a `--dump-config`
+// recomposition. If anything fails, the file is restored. Mount the same plugin
+// twice and DSH refuses with "duplicate exact route" (two web routes) or a
+// duplicated MCP server, which is why "disable host + add to preset" is a move,
+// never a copy.
+//
+// ── Commands ──────────────────────────────────────────────────────────────
+//
+//   dsh-preset-plugin list                        every plugin and where it lives
+//   dsh-preset-plugin where <plugin>              one plugin, with row ids
+//   dsh-preset-plugin move <plugin> <preset,...>  host → these presets only
+//   dsh-preset-plugin everywhere <plugin>         undo: back to every preset
+//   dsh-preset-plugin off <plugin>                mounted in no preset
+//
+// Flags: --profile <name> (default web)   --dry-run   --row-id <id> (override)
+
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import { createRequire } from 'node:module'
+
+const require = createRequire(import.meta.url)
+const { execFileSync } = require('node:child_process')
+
+const DSH_HOME = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh')
+const DSH_ROOT = (() => {
+  const prefix = path.resolve(path.dirname(process.execPath), '..')
+  const cand = path.join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh')
+  if (fs.existsSync(cand)) return cand
+  const nvm = path.join(os.homedir(), '.nvm', 'versions', 'node')
+  for (const v of fs.existsSync(nvm) ? fs.readdirSync(nvm) : []) {
+    const p = path.join(nvm, v, 'lib', 'node_modules', '@deepseek-ai', 'dsh')
+    if (fs.existsSync(p)) return p
+  }
+  throw new Error('cannot locate the dsh install; set DSH_ROOT')
+})()
+const yaml = (await import(path.join(DSH_ROOT, 'node_modules', 'js-yaml', 'index.js'))).default
+
+const USAGE = `dsh-preset-plugin — choose which presets a plugin is mounted in
+
+usage: dsh-preset-plugin [--profile <name>] [--dry-run] <command>
+
+  list                              all plugins and where they live
+  where <plugin>                    one plugin, with row ids and preset rows
+  move <plugin> <preset>[,<preset>] move it out of "everyone" into those presets
+  everywhere <plugin>               put it back for every preset (the default)
+  off <plugin>                      mounted in no preset at all
+
+A plugin installed as a bundle is mounted for EVERY preset. \`move\` switches the
+bundle's own row off and declares one row inside each named preset, so it loads
+once, only where you asked.
+`
+
+const argv = process.argv.slice(2)
+let profile = 'web'
+let dryRun = false
+let rowId = null
+const pos = []
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i]
+  if (a === '--profile') profile = argv[++i]
+  else if (a === '--profile='.slice(0, 10)) profile = a.slice(10)
+  else if (a === '--dry-run') dryRun = true
+  else if (a === '--row-id') rowId = argv[++i]
+  else if (a === '-h' || a === '--help') { console.log(USAGE); process.exit(0) }
+  else pos.push(a)
+}
+const cmd = pos[0] ?? 'list'
+
+const PATCH = path.join(DSH_HOME, 'profiles', profile, 'cordis.patch.yml')
+
+// ─────────────────────────────────────────────────────────────── read the tree
+
+function compose() {
+  const yml = execFileSync('dsh', ['--profile', profile, '--dump-config'], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'inherit'],
+  })
+  const SCHEMA = yaml.DEFAULT_SCHEMA.extend([
+    new yaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: (d) => ({ __js: String(d) }) }),
+  ])
+  const doc = yaml.load(yml, { schema: SCHEMA })
+  if (!Array.isArray(doc)) throw new Error('--dump-config produced no entry list')
+  return doc
+}
+
+function splitModule(moduleName) {
+  if (!moduleName) return { pkg: null, sub: null }
+  const parts = moduleName.split('/')
+  const pkg = moduleName.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+  return { pkg, sub: moduleName === pkg ? null : moduleName.slice(pkg.length + 1) }
+}
+
+function isJs(value) {
+  return typeof value === 'object' && value !== null && ('__js' in value || '__jsExpr' in value)
+}
+
+function disabledState(value) {
+  if (value === undefined) return false
+  if (!isJs(value)) return Boolean(value)
+  const expr = value.__js ?? value.__jsExpr
+  try {
+    return Boolean(new Function('process', 'ctx', `return (${expr})`)(process, { get: () => undefined }))
+  } catch {
+    return 'conditional'
+  }
+}
+
+function flatten(rows, out = []) {
+  for (const row of rows ?? []) {
+    if (!row || typeof row !== 'object') continue
+    if (row.group === true) { flatten(row.config, out); continue }
+    out.push(row)
+  }
+  return out
+}
+
+function inventory(doc) {
+  const presets = doc.filter((r) => r && r.name === '@deepseek-ai/dsh-agent-preset')
+  const host = doc.filter((r) => r && r.name && r.name !== '@deepseek-ai/dsh-agent-preset' && r.group !== true)
+  const where = new Map() // pkg -> { host: [rows], presets: Map<preset, rows> }
+  const keyOf = (name) => splitModule(name).pkg
+
+  for (const row of host) {
+    const pkg = keyOf(row.name)
+    if (!where.has(pkg)) where.set(pkg, { host: [], allHost: [], presets: new Map() })
+    where.get(pkg).allHost.push(row)
+    if (disabledState(row.disabled) !== true) where.get(pkg).host.push(row)
+  }
+  for (const p of presets) {
+    const pid = p.config?.id
+    for (const row of flatten(p.config?.plugins)) {
+      const pkg = keyOf(row.name)
+      if (!where.has(pkg)) where.set(pkg, { host: [], presets: new Map() })
+      const entry = where.get(pkg)
+      if (disabledState(row.disabled) === false) {
+        if (!entry.presets.has(pid)) entry.presets.set(pid, [])
+        entry.presets.get(pid).push(row)
+      }
+    }
+  }
+  return { presets: presets.map((p) => p.config?.id), where }
+}
+
+// ─────────────────────────────────────────────────────────────── text surgery
+
+const INDENT = (line) => line.match(/^ */)[0].length
+
+/** End index (exclusive) of the top-level list item starting at `start`. */
+function itemEnd(lines, start) {
+  const indent = INDENT(lines[start])
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue
+    if (INDENT(line) <= indent && /^\s*- /.test(line)) return i
+  }
+  return lines.length
+}
+
+/** Index of the `plugins:` key line inside the preset item starting at `start`. */
+function pluginsLine(lines, start) {
+  const end = itemEnd(lines, start)
+  for (let i = start; i < end; i++) {
+    if (/^\s*plugins:\s*$/.test(lines[i])) return i
+  }
+  return -1
+}
+
+function findPresetItem(lines, presetId) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*- id: preset-/.test(lines[i])) continue
+    const end = itemEnd(lines, i)
+    for (let j = i; j < end; j++) {
+      if (new RegExp(`^\\s*id:\\s*${presetId}\\s*$`).test(lines[j])) return i
+    }
+  }
+  return -1
+}
+
+/**
+ * Index just past the last line a child row owns. A row starts at `- id:` and
+ * keeps every following line that is more indented (plus blanks/comments).
+ */
+function rowEnd(lines, index, limit) {
+  const indent = INDENT(lines[index])
+  for (let i = index + 1; i < limit; i++) {
+    const line = lines[i]
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue
+    if (INDENT(line) <= indent) return i
+  }
+  return limit
+}
+
+function childRows(lines, itemStart) {
+  const pl = pluginsLine(lines, itemStart)
+  if (pl < 0) return { pluginsLine: -1, rows: [] }
+  const end = itemEnd(lines, itemStart)
+  const rows = []
+  for (let i = pl + 1; i < end; i++) {
+    const m = /^(\s*)- id:\s*(\S+)/.exec(lines[i])
+    if (m) rows.push({ index: i, id: m[2] })
+    else if (lines[i].trim() !== '' && !lines[i].trimStart().startsWith('#') && INDENT(lines[i]) <= INDENT(lines[pl])) break
+  }
+  return { pluginsLine: pl, rows }
+}
+
+function hostDisableEntry(lines, entryId) {
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^-\s*id:\s*(\S+)\s*$/.exec(lines[i])
+    if (!m || m[1] !== entryId) continue
+    // top-level entry (indent 0); is it a disabled: true entry of ours?
+    const end = itemEnd(lines, i)
+    const block = lines.slice(i, end).join('\n')
+    return { index: i, end, disabled: /^\s*disabled:\s*true\s*$/m.test(block) }
+  }
+  return null
+}
+
+function verify(fileContents) {
+  yaml.load(fileContents, { schema: yaml.DEFAULT_SCHEMA.extend([
+    new yaml.Type('tag:yaml.org,2002:js', { kind: 'scalar', construct: () => null }),
+  ]) })
+  const tmp = PATCH + '.dsh-preset-plugin.tmp'
+  fs.copyFileSync(PATCH, tmp)
+  fs.writeFileSync(PATCH, fileContents)
+  try {
+    // Compose with the CANDIDATE file in place: layering it as an extra
+    // --patch overlay would apply the same edit twice and hide real errors.
+    execFileSync('dsh', ['--profile', profile, '--dump-config'], {
+      encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'],
+    })
+  } finally {
+    fs.rmSync(tmp, { force: true })
+  }
+}
+
+function write(fileContents, summary) {
+  if (dryRun) {
+    console.log(`would write ${PATCH}:`)
+    for (const line of summary) console.log('  ' + line)
+    return
+  }
+  const backup = `${PATCH}.bak-preset-plugin-${Date.now()}`
+  fs.copyFileSync(PATCH, backup)
+  try {
+    verify(fileContents)
+    fs.writeFileSync(PATCH, fileContents)
+  } catch (error) {
+    fs.copyFileSync(backup, PATCH)
+    console.error(`aborted, ${path.basename(PATCH)} restored:\n  ${String(error.message).split('\n')[0]}`)
+    process.exit(1)
+  }
+  console.log(`wrote ${PATCH}`)
+  for (const line of summary) console.log('  ' + line)
+  console.log(`  backup: ${path.basename(backup)}`)
+  console.log(`\n  restart dsh when convenient: dsh web`)
+}
+
+// ────────────────────────────────────────────────────────────────── commands
+
+function loadLines() {
+  return fs.readFileSync(PATCH, 'utf8').split('\n')
+}
+
+function describePlugin(where, pkg) {
+  const entry = where.get(pkg)
+  if (!entry) return null
+  const presets = [...entry.presets.keys()].sort()
+  return {
+    everywhere: entry.host.length > 0 && presets.length === 0,
+    hostRows: entry.host.map((r) => r.id),
+    allHostRows: entry.allHost.map((r) => r.id),
+    presets,
+    rowsByPreset: Object.fromEntries([...entry.presets].map(([k, v]) => [k, v.map((r) => r.id)])),
+  }
+}
+
+const doc = compose()
+const { where, presets } = inventory(doc)
+
+if (cmd === 'list') {
+  const rows = []
+  for (const [pkg, entry] of [...where].sort()) {
+    const d = describePlugin(where, pkg)
+    const hostOn = entry.host.length > 0
+    if (!hostOn && d.presets.length === 0) continue
+    const all = presets.length
+    const place = hostOn && d.presets.length === 0 ? 'everyone (host row)'
+      : hostOn ? `everyone (host) + ${d.presets.join(', ')}`
+        : d.presets.length === all ? 'every preset (declared per preset)'
+          : d.presets.join(', ')
+    rows.push([pkg, place])
+  }
+  const w = Math.max(...rows.map((r) => r[0].length), 5)
+  console.log()
+  console.log('  ' + 'plugin'.padEnd(w) + '  mounted in')
+  console.log('  ' + '─'.repeat(w) + '  ──────────')
+  for (const [pkg, place] of rows) {
+    const mark = place.startsWith('every') ? '  ' : '* '
+    console.log(`  ${mark}${pkg.padEnd(w)}  ${place}`)
+  }
+  console.log()
+  console.log('  presets: ' + presets.join(', '))
+  console.log('  * = scoped to presets. "everyone" means a host row, visible in every preset.')
+  console.log()
+  process.exit(0)
+}
+
+const plugin = pos[1]
+if (!plugin) { console.error(USAGE); process.exit(2) }
+
+// resolve the package that owns this plugin name
+const matches = [...where.keys()].filter((pkg) => pkg === plugin || pkg.endsWith('/' + plugin) || pkg === '@deepseek-ai/' + plugin)
+const pkg = rowId ? [...where.keys()].find((k) => (where.get(k).host ?? []).some((r) => r.id === rowId)) : matches[0]
+if (!pkg) {
+  console.error(`no mounted plugin matches "${plugin}"`)
+  const near = [...where.keys()].filter((k) => k.includes(plugin)).slice(0, 8)
+  if (near.length) console.error(`did you mean: ${near.join(', ')}`)
+  process.exit(2)
+}
+const info = describePlugin(where, pkg)
+
+if (cmd === 'where') {
+  console.log(`\n  ${pkg}`)
+  console.log(`  host rows (visible in every preset): ${info.hostRows.join(', ') || 'none — the host row is disabled'}`)
+  console.log(`  preset rows: ${info.presets.length ? info.presets.map((p) => `${p} (${info.rowsByPreset[p].join(', ')})`).join(' · ') : 'none'}`)
+  console.log()
+  process.exit(0)
+}
+
+const targets = (pos[2] ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+
+// Which presets this profile's patch can actually edit: only the ones it
+// declares itself. The shipped presets live inside bundle patch files.
+const lines = loadLines()
+const localPresets = []
+for (let i = 0; i < lines.length; i++) {
+  if (!/^\s*- id: preset-/.test(lines[i])) continue
+  const end = itemEnd(lines, i)
+  const rowIdHere = lines[i].replace(/^\s*- id:\s*/, '').trim()
+  for (let j = i + 1; j < end; j++) {
+    const m = /^\s+id:\s*(\S+)\s*$/.exec(lines[j])
+    if (m && m[1] !== rowIdHere) { localPresets.push(m[1]); break }
+  }
+}
+
+const summary = []
+const original = info
+
+if (cmd === 'move' || cmd === 'off') {
+  if (cmd === 'move' && targets.length === 0) { console.error('move needs at least one preset'); process.exit(2) }
+  // A plugin whose rows are declared INSIDE a shipped preset cannot be moved
+  // by editing this file: the row is in the bundle, not here.
+  const shippedOnly = info.presets.filter((x) => !localPresets.includes(x))
+  if (original.hostRows.length === 0 && shippedOnly.length > 0) {
+    console.error(`\n  ${pkg} is declared inside the shipped presets (${shippedOnly.join(', ')}).`)
+    console.error('  Those rows live in the bundle patch files, not in this profile, so this')
+    console.error('  tool cannot remove them. Override the row id in cordis.patch.yml instead,')
+    console.error('  or pick a plugin that was installed as a bundle.\n')
+    process.exit(2)
+  }
+  for (const t of targets) {
+    if (!presets.includes(t)) {
+      console.error(`unknown preset "${t}" — available: ${presets.join(', ')}`)
+      process.exit(2)
+    }
+  }
+}
+
+// 1. switch off every enabled host row of this plugin
+for (const id of original.hostRows) {
+  const found = hostDisableEntry(lines, id)
+  if (found && found.disabled) continue
+  if (found) {
+    // entry exists but is not disabled (e.g. re-enabling case) — replace its body
+    lines.splice(found.index, found.end - found.index, `- id: ${id}`, '  disabled: true')
+    summary.push(`host row ${id}: disabled`)
+  } else {
+    lines.push('', `# moved out of "everyone" by dsh-preset-plugin`, `- id: ${id}`, '  disabled: true')
+    summary.push(`host row ${id}: disabled (appended)`)
+  }
+}
+
+// 2. remove this plugin's child rows from presets it should leave
+// `everywhere` and `off` must REMOVE preset rows, never add them: the mount
+// that makes a plugin available to every preset is the bundle's own host row.
+const wanted = cmd === 'off' || cmd === 'everywhere' ? [] : targets
+for (const presetId of presets) {
+  const item = findPresetItem(lines, presetId)
+  if (item < 0) continue
+  const { rows } = childRows(lines, item)
+  const mine = rows.filter((r) => {
+    const line = lines[r.index]
+    const nameLine = lines[r.index + 1] ?? ''
+    const m = /name:\s*['"]?([^'"\n]+)/.exec(nameLine)
+    const rowPkg = m ? splitModule(m[1].trim()).pkg : null
+    return rowPkg === pkg
+  })
+  const shouldStay = wanted.includes(presetId)
+  if (!shouldStay) {
+    const itemLimit = itemEnd(lines, item)
+    for (const row of mine.reverse()) {
+      // A row owns its `- id:` line AND every line indented under it; removing
+      // only the first line leaves an orphan key in the previous mapping.
+      const stop = rowEnd(lines, row.index, itemLimit)
+      lines.splice(row.index, stop - row.index)
+      summary.push(`${presetId}: removed row ${row.id}`)
+    }
+    continue
+  }
+  if (mine.length === 0) {
+    const { pluginsLine: pl, rows: allRows } = childRows(lines, item)
+    if (pl < 0) { summary.push(`${presetId}: NO plugins: key, skipped`); continue }
+    const indent = allRows.length ? ' '.repeat(INDENT(lines[allRows[0].index])) : ' '.repeat(INDENT(lines[pl]) + 2)
+    // Insert after the END of the last child row, not after its `- id:` line:
+    // a row owns its `name:`/`config:` lines, and inserting mid-row creates a
+    // duplicate mapping key.
+    const at = allRows.length ? rowEnd(lines, allRows[allRows.length - 1].index, itemEnd(lines, item)) : pl + 1
+    lines.splice(at, 0, `${indent}- id: ${pkg.replace(/^@[^/]+\//, '')}`, `${indent}  name: ${pkg}`)
+    summary.push(`${presetId}: added row for ${pkg}`)
+  } else {
+    summary.push(`${presetId}: already has ${mine.length} row(s)`)
+  }
+}
+
+// 3. `everywhere` also re-enables the bundle's own row
+if (cmd === 'everywhere') {
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^-\s*id:\s*(\S+)\s*$/.exec(lines[i])
+    if (!m || !original.allHostRows.includes(m[1])) continue
+    const end = itemEnd(lines, i)
+    const block = lines.slice(i, end).join('\n')
+    if (!/^\s*disabled:\s*true\s*$/m.test(block)) continue
+    // drop our own marker comment above the entry, so a move+undo leaves no trace
+    let from = i
+    while (from > 0 && lines[from - 1].trim() === '') from--
+    if (from > 0 && /dsh-preset-plugin/.test(lines[from - 1])) from--
+    // Our disable entry is exactly `- id: X` + `disabled: true`; deleting it
+    // entirely is what restores the bundle's own row. Leaving `- id: X` behind
+    // would be a no-op entry that still shows up in every future diff.
+    lines.splice(from, end - from)
+    if (from > 0 && lines[from - 1].trim() === '' && (lines[from] ?? '').trim() === '') lines.splice(from, 1)
+    i = from
+    summary.push(`host row ${m[1]}: re-enabled`)
+  }
+}
+
+if (summary.length === 0) {
+  console.log(`\n  ${pkg} is already where you asked (${cmd}).\n`)
+  process.exit(0)
+}
+// Only guarantee a trailing newline. Anything more (collapsing blank runs)
+// rewrites regions this tool never touched, which makes a move + undo show up
+// as churn in every diff.
+// Collapse only the run of newlines at EOF, so the body keeps every blank line
+// the user wrote and a round trip leaves the file byte-identical.
+const text = lines.join('\n').replace(/\n*$/, '\n')
+write(text, summary)
