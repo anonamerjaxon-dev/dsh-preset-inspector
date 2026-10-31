@@ -88,7 +88,8 @@ byte-identical.
 
 ## Requirements
 
-- DeepSeek Harness `0.2.1-rc.2` (the preset registry API it reads).
+- DeepSeek Harness `0.2.1-rc.2` or newer in the 0.2.1 line (verified against
+  `0.2.1-rc.4` on 2026-10-31; it reads the preset registry API).
 - Node `>= 22`.
 
 No runtime dependencies.
